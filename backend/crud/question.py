@@ -1,0 +1,154 @@
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+
+from models.question  import Question
+from models.interview import Interview
+from models.user      import Users
+from schemas.question import QuestionAnswer
+from services.answer_evaluator import evaluate_answer
+from crud.report import generate_final_report, get_interview_report
+from utils.logger import logger
+
+
+def create_questions(interview_id: int, questions: dict, db: Session):
+    try:
+        logger.info(f"Creating questions for interview {interview_id}")
+        for q in questions["questions"]:
+            question = Question(
+                interview_id            = interview_id,
+                question                = q["question"],
+                category                = q["category"],
+                follow_up               = q["follow_up"],
+                expected_answer_points  = q["expected_answer_points"],
+                difficulty              = q["difficulty_tag"],
+                time_limit              = q["time_limit_minutes"]
+            )
+            db.add(question)
+
+        db.commit()
+        logger.info("Questions saved successfully")
+        return {"message": "Questions created successfully"}
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Failed to create questions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def get_next_question(interview_id: int, current_user: Users, db: Session):
+    # Verify ownership
+    interview = db.query(Interview).filter_by(
+        id=interview_id, user_email=current_user.Email
+    ).first()
+
+    if not interview:
+        raise HTTPException(status_code=403, detail="You are not allowed to access this interview.")
+
+    # First unanswered question
+    question = (
+        db.query(Question)
+        .filter(Question.interview_id == interview_id, Question.user_answer == None)
+        .first()
+    )
+
+    if not question:
+        raise HTTPException(status_code=404, detail="Interview completed.")
+
+    current_question = (
+        db.query(Question)
+        .filter(Question.interview_id == interview_id, Question.id <= question.id)
+        .count()
+    )
+
+    return {
+        "id":               question.id,
+        "company":          interview.company,
+        "role":             interview.role,
+        "current_question": current_question,
+        "total_questions":  interview.no_of_questions,
+        "category":         question.category,
+        "difficulty_tag":   question.difficulty,
+        "question":         question.question
+    }
+
+
+def submit_answer(question_id: int, answer: QuestionAnswer, current_user: Users, db: Session):
+    try:
+        logger.info(f"Submitting answer for question {question_id}")
+
+        question = db.query(Question).filter_by(id=question_id).first()
+        if not question:
+            raise HTTPException(status_code=404, detail="Question not found.")
+
+        interview = db.query(Interview).filter_by(
+            id=question.interview_id, user_email=current_user.Email
+        ).first()
+        if not interview:
+            raise HTTPException(status_code=403, detail="You are not authorized to answer this question.")
+
+        if question.user_answer:
+            raise HTTPException(status_code=400, detail="Question already answered.")
+
+        try:
+            evaluation = evaluate_answer(
+                question    = question.question,
+                user_answer = answer.user_answer,
+                role        = interview.role,
+                difficulty  = interview.difficulty
+            )
+        except Exception as e:
+            logger.error(f"AI evaluation failed: {e}")
+            raise HTTPException(status_code=500, detail="AI evaluation failed.")
+
+        question.user_answer   = answer.user_answer
+        question.score         = evaluation["score"]
+        question.ai_feedback   = evaluation["feedback"]
+        question.correct_answer= evaluation["correct_answer"]
+        question.strengths     = evaluation["strengths"]
+        question.improvements  = evaluation["improvements"]
+
+        db.commit()
+        db.refresh(question)
+        logger.info("Evaluation stored in database")
+
+        next_question = (
+            db.query(Question)
+            .filter(Question.interview_id == interview.id, Question.user_answer.is_(None))
+            .order_by(Question.id)
+            .first()
+        )
+
+        if next_question is None:
+            generate_final_report(question.interview_id, db)
+            report = get_interview_report(question.interview_id, current_user, db)
+            return {"completed": True, "evaluation": evaluation, "report": report}
+
+        current_question = (
+            db.query(Question)
+            .filter(Question.interview_id == interview.id, Question.id <= next_question.id)
+            .count()
+        )
+
+        return {
+            "evaluation": evaluation,
+            "next_question": {
+                "id":               next_question.id,
+                "company":          interview.company,
+                "role":             interview.role,
+                "current_question": current_question,
+                "total_questions":  interview.no_of_questions,
+                "category":         next_question.category,
+                "difficulty_tag":   next_question.difficulty,
+                "question":         next_question.question
+            },
+            "completed": False
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
